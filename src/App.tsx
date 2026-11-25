@@ -1,0 +1,858 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  BookOpen,
+  ChevronLeft,
+  ChevronRight,
+  Cloud,
+  Download,
+  Edit3,
+  Eye,
+  Heart,
+  Home,
+  ImagePlus,
+  LogOut,
+  RefreshCw,
+  Save,
+  Search,
+  Upload,
+  UserPlus,
+  Users,
+} from 'lucide-react';
+import { createInitialBookData } from './data/sampleBook';
+import {
+  fetchDriveImageAsObjectUrl,
+  findOrCreateBookInDrive,
+  requestGoogleDriveToken,
+  saveBookToDrive,
+  uploadPhotoToDrive,
+} from './services/googleDriveService';
+import { FamilyBookData, Gender, NuclearFamily, Person } from './types/family';
+
+const CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID as string;
+
+export default function App() {
+  const [book, setBook] = useState<FamilyBookData>(() => createInitialBookData());
+  const [currentFamilyId, setCurrentFamilyId] = useState<string>('fam-1');
+  const [historyStack, setHistoryStack] = useState<string[]>([]);
+  const [isEditMode, setIsEditMode] = useState<boolean>(false);
+
+  // Pencarian nama anggota keluarga
+  const [searchQuery, setSearchQuery] = useState<string>('');
+
+  // State Google Drive
+  const [accessToken, setAccessToken] = useState<string | null>(null);
+  const [driveFileId, setDriveFileId] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState<string>('Mode Lokal (Contoh)');
+  const [isSyncing, setIsSyncing] = useState<boolean>(false);
+
+  // Cache URL gambar dari Google Drive (fileId -> objectUrl)
+  const [photoUrls, setPhotoUrls] = useState<Record<string, string>>({});
+
+  // Form tambah anak
+  const [newChildName, setNewChildName] = useState('');
+  const [newChildGender, setNewChildGender] = useState<Gender>('M');
+  const [newChildBirthYear, setNewChildBirthYear] = useState('');
+
+  // Input file tersembunyi untuk Import JSON & upload foto
+  const importJsonInputRef = useRef<HTMLInputElement | null>(null);
+  const bgPhotoInputRef = useRef<HTMLInputElement | null>(null);
+  const profilePhotoInputRef = useRef<HTMLInputElement | null>(null);
+  const [activePhotoPersonId, setActivePhotoPersonId] = useState<string | null>(null);
+
+  const currentFamily: NuclearFamily | undefined = book.families[currentFamilyId];
+  const husband: Person | undefined = currentFamily?.husbandId
+    ? book.people[currentFamily.husbandId]
+    : undefined;
+  const wife: Person | undefined = currentFamily?.wifeId
+    ? book.people[currentFamily.wifeId]
+    : undefined;
+
+  const children: Person[] = useMemo(() => {
+    if (!currentFamily) return [];
+    return currentFamily.childrenIds
+      .map((id) => book.people[id])
+      .filter((p): p is Person => Boolean(p));
+  }, [currentFamily, book.people]);
+
+  const familyKeys = Object.keys(book.families);
+  const currentPageIndex = Math.max(0, familyKeys.indexOf(currentFamilyId));
+
+  // Hasil pencarian nama anggota keluarga + halaman keluarga intinya
+  const searchResults = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return [];
+
+    return Object.values(book.people)
+      .filter((person) => person.name.toLowerCase().includes(q))
+      .slice(0, 8)
+      .map((person) => {
+        // Prioritas halaman keluarga inti milik orang tersebut, atau halaman orang tuanya
+        const targetFamilyId =
+          person.ownFamilyIds[0] ||
+          person.parentFamilyId ||
+          Object.values(book.families).find(
+            (f) =>
+              f.husbandId === person.id ||
+              f.wifeId === person.id ||
+              f.childrenIds.includes(person.id)
+          )?.id ||
+          null;
+
+        return { person, targetFamilyId };
+      });
+  }, [searchQuery, book.people, book.families]);
+
+  // Muat gambar dari Google Drive ke cache objectUrl
+  useEffect(() => {
+    if (!accessToken) return;
+
+    const neededIds = new Set<string>();
+    if (currentFamily?.backgroundPhotoId) neededIds.add(currentFamily.backgroundPhotoId);
+    if (husband?.photoId) neededIds.add(husband.photoId);
+    if (wife?.photoId) neededIds.add(wife.photoId);
+    children.forEach((c) => {
+      if (c.photoId) neededIds.add(c.photoId);
+    });
+
+    neededIds.forEach((fileId) => {
+      if (photoUrls[fileId]) return;
+      fetchDriveImageAsObjectUrl(accessToken, fileId)
+        .then((objUrl) => {
+          setPhotoUrls((prev) => ({ ...prev, [fileId]: objUrl }));
+        })
+        .catch(() => {
+          // Abaikan jika gagal memuat satu foto agar halaman tidak error
+        });
+    });
+  }, [accessToken, currentFamily, husband, wife, children, photoUrls]);
+
+  const goToFamily = (targetFamilyId: string) => {
+    if (!book.families[targetFamilyId] || targetFamilyId === currentFamilyId) return;
+    setHistoryStack((prev) => [...prev, currentFamilyId]);
+    setCurrentFamilyId(targetFamilyId);
+    setSearchQuery('');
+  };
+
+  const handleBackPage = () => {
+    if (historyStack.length > 0) {
+      const prevId = historyStack[historyStack.length - 1];
+      setHistoryStack((prev) => prev.slice(0, -1));
+      setCurrentFamilyId(prevId);
+      return;
+    }
+    if (currentPageIndex > 0) {
+      setCurrentFamilyId(familyKeys[currentPageIndex - 1]);
+    }
+  };
+
+  const handleNextPage = () => {
+    if (currentPageIndex < familyKeys.length - 1) {
+      goToFamily(familyKeys[currentPageIndex + 1]);
+    }
+  };
+
+  const connectGoogleDrive = async (forceAccountSelect = false) => {
+    if (!CLIENT_ID) {
+      setStatusMessage('VITE_GOOGLE_CLIENT_ID belum diatur di .env / Vercel.');
+      return;
+    }
+    try {
+      setIsSyncing(true);
+      setStatusMessage(
+        forceAccountSelect
+          ? 'Membuka pilihan akun Google...'
+          : 'Menghubungkan ke Google Drive...'
+      );
+      const token = await requestGoogleDriveToken(CLIENT_ID, forceAccountSelect);
+      const driveFile = await findOrCreateBookInDrive(token, book);
+      setAccessToken(token);
+      setDriveFileId(driveFile.fileId);
+      setBook(driveFile.data);
+      const firstId =
+        driveFile.data.rootFamilyId && driveFile.data.families[driveFile.data.rootFamilyId]
+          ? driveFile.data.rootFamilyId
+          : Object.keys(driveFile.data.families)[0];
+      if (firstId) setCurrentFamilyId(firstId);
+      setStatusMessage(`Terhubung: ${driveFile.name}`);
+    } catch (err) {
+      setStatusMessage(err instanceof Error ? err.message : 'Gagal terhubung ke Drive');
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  const handleSwitchAccount = async () => {
+    setAccessToken(null);
+    setDriveFileId(null);
+    setPhotoUrls({});
+    await connectGoogleDrive(true);
+  };
+
+  const handleDisconnectLocalSession = () => {
+    setAccessToken(null);
+    setDriveFileId(null);
+    setPhotoUrls({});
+    setStatusMessage('Sesi Drive dilepas (Mode Lokal)');
+  };
+
+  const handleSaveDrive = async () => {
+    if (!accessToken || !driveFileId) {
+      setStatusMessage('Hubungkan Google Drive dulu untuk menyimpan.');
+      return;
+    }
+    try {
+      setIsSyncing(true);
+      setStatusMessage('Menyimpan ke Google Drive...');
+      await saveBookToDrive(accessToken, driveFileId, book);
+      setStatusMessage('Tersimpan ke Google Drive');
+    } catch (err) {
+      setStatusMessage(err instanceof Error ? err.message : 'Gagal menyimpan');
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  // Export cadangan JSON ke perangkat
+  const handleExportJson = () => {
+    const blob = new Blob([JSON.stringify(book, null, 2)], {
+      type: 'application/json',
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `backup-silsilah-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    setStatusMessage('File cadangan JSON berhasil diunduh.');
+  };
+
+  // Import JSON (pemulihan saat data bermasalah atau pindah data)
+  const handleImportJsonFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text) as FamilyBookData;
+
+      if (
+        !parsed ||
+        typeof parsed !== 'object' ||
+        !parsed.people ||
+        !parsed.families ||
+        Object.keys(parsed.families).length === 0
+      ) {
+        throw new Error('Format JSON tidak sesuai struktur buku silsilah.');
+      }
+
+      const nextFamilyId =
+        parsed.rootFamilyId && parsed.families[parsed.rootFamilyId]
+          ? parsed.rootFamilyId
+          : Object.keys(parsed.families)[0];
+
+      setBook(parsed);
+      setCurrentFamilyId(nextFamilyId);
+      setHistoryStack([]);
+      setStatusMessage(`Data diimpor dari ${file.name}. Klik "Simpan Drive" untuk menyinkronkan.`);
+    } catch (err) {
+      setStatusMessage(
+        err instanceof Error ? err.message : 'Gagal mengimpor file JSON.'
+      );
+    }
+  };
+
+  // Upload foto background halaman keluarga ke Drive
+  const handleUploadBackgroundPhoto = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file || !currentFamily) return;
+
+    if (!accessToken) {
+      setStatusMessage('Hubungkan Google Drive terlebih dahulu untuk mengunggah foto.');
+      return;
+    }
+
+    try {
+      setIsSyncing(true);
+      setStatusMessage('Mengunggah foto background ke Google Drive...');
+      const fileId = await uploadPhotoToDrive(accessToken, file, `bg-${currentFamily.id}`);
+      const previewUrl = URL.createObjectURL(file);
+
+      setPhotoUrls((prev) => ({ ...prev, [fileId]: previewUrl }));
+      setBook((prev) => ({
+        ...prev,
+        families: {
+          ...prev.families,
+          [currentFamily.id]: {
+            ...currentFamily,
+            backgroundPhotoId: fileId,
+          },
+        },
+      }));
+      setStatusMessage('Foto background terunggah. Klik "Simpan Drive" untuk menyimpan data.');
+    } catch (err) {
+      setStatusMessage(err instanceof Error ? err.message : 'Gagal unggah foto background.');
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  // Upload foto profil anggota keluarga ke Drive
+  const handleUploadProfilePhoto = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    const personId = activePhotoPersonId;
+    setActivePhotoPersonId(null);
+
+    if (!file || !personId || !book.people[personId]) return;
+    if (!accessToken) {
+      setStatusMessage('Hubungkan Google Drive terlebih dahulu untuk mengunggah foto profil.');
+      return;
+    }
+
+    try {
+      setIsSyncing(true);
+      setStatusMessage('Mengunggah foto profil ke Google Drive...');
+      const fileId = await uploadPhotoToDrive(accessToken, file, `profil-${personId}`);
+      const previewUrl = URL.createObjectURL(file);
+
+      setPhotoUrls((prev) => ({ ...prev, [fileId]: previewUrl }));
+      setBook((prev) => ({
+        ...prev,
+        people: {
+          ...prev.people,
+          [personId]: {
+            ...prev.people[personId],
+            photoId: fileId,
+          },
+        },
+      }));
+      setStatusMessage('Foto profil terunggah. Klik "Simpan Drive" untuk menyimpan data.');
+    } catch (err) {
+      setStatusMessage(err instanceof Error ? err.message : 'Gagal unggah foto profil.');
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  const triggerProfilePhotoUpload = (personId: string) => {
+    setActivePhotoPersonId(personId);
+    profilePhotoInputRef.current?.click();
+  };
+
+  const handleAddChild = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!currentFamily || !newChildName.trim()) return;
+
+    const childId = `p-${Date.now()}`;
+    const newPerson: Person = {
+      id: childId,
+      name: newChildName.trim(),
+      gender: newChildGender,
+      birthYear: newChildBirthYear.trim() || undefined,
+      parentFamilyId: currentFamily.id,
+      ownFamilyIds: [],
+    };
+
+    setBook((prev) => ({
+      ...prev,
+      people: {
+        ...prev.people,
+        [childId]: newPerson,
+      },
+      families: {
+        ...prev.families,
+        [currentFamily.id]: {
+          ...currentFamily,
+          childrenIds: [...currentFamily.childrenIds, childId],
+        },
+      },
+    }));
+
+    setNewChildName('');
+    setNewChildBirthYear('');
+  };
+
+  const handleCreateChildFamilyPage = (child: Person) => {
+    const newFamId = `fam-${Date.now()}`;
+    const newFamily: NuclearFamily = {
+      id: newFamId,
+      husbandId: child.gender === 'M' ? child.id : null,
+      wifeId: child.gender === 'F' ? child.id : null,
+      childrenIds: [],
+    };
+
+    setBook((prev) => ({
+      ...prev,
+      people: {
+        ...prev.people,
+        [child.id]: {
+          ...child,
+          ownFamilyIds: [...child.ownFamilyIds, newFamId],
+        },
+      },
+      families: {
+        ...prev.families,
+        [newFamId]: newFamily,
+      },
+    }));
+
+    goToFamily(newFamId);
+  };
+
+  const bgImageUrl = currentFamily?.backgroundPhotoId
+    ? photoUrls[currentFamily.backgroundPhotoId]
+    : undefined;
+
+  return (
+    <div className="min-h-screen bg-stone-100 text-stone-800 flex flex-col">
+      {/* Input File Tersembunyi */}
+      <input
+        ref={importJsonInputRef}
+        type="file"
+        accept="application/json,.json"
+        onChange={handleImportJsonFile}
+        className="hidden"
+      />
+      <input
+        ref={bgPhotoInputRef}
+        type="file"
+        accept="image/*"
+        onChange={handleUploadBackgroundPhoto}
+        className="hidden"
+      />
+      <input
+        ref={profilePhotoInputRef}
+        type="file"
+        accept="image/*"
+        onChange={handleUploadProfilePhoto}
+        className="hidden"
+      />
+
+      {/* Top Bar */}
+      <header className="bg-amber-950 text-amber-50 px-4 py-3 shadow-md">
+        <div className="max-w-6xl mx-auto flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5">
+            <BookOpen className="w-6 h-6 text-amber-300" />
+            <div>
+              <h1 className="font-serif text-lg font-bold leading-tight">{book.bookTitle}</h1>
+              <p className="text-xs text-amber-200/80 flex items-center gap-1.5">
+                <Cloud className="w-3.5 h-3.5" /> {statusMessage}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={() => connectGoogleDrive(false)}
+              disabled={isSyncing}
+              className="px-3 py-1.5 rounded-lg bg-amber-700 hover:bg-amber-600 text-xs font-medium transition cursor-pointer disabled:opacity-50"
+            >
+              {accessToken ? 'Drive Terhubung' : 'Hubungkan Drive'}
+            </button>
+
+            <button
+              onClick={handleSwitchAccount}
+              disabled={isSyncing}
+              className="px-3 py-1.5 rounded-lg bg-amber-900 hover:bg-amber-800 border border-amber-700 text-xs font-medium flex items-center gap-1 transition cursor-pointer disabled:opacity-50"
+              title="Ganti akun Google Drive"
+            >
+              <RefreshCw className="w-3.5 h-3.5" /> Ganti Akun
+            </button>
+
+            {accessToken && (
+              <>
+                <button
+                  onClick={handleSaveDrive}
+                  disabled={isSyncing}
+                  className="px-3 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-xs font-medium flex items-center gap-1 transition cursor-pointer disabled:opacity-50"
+                >
+                  <Save className="w-3.5 h-3.5" /> Simpan Drive
+                </button>
+                <button
+                  onClick={handleDisconnectLocalSession}
+                  className="px-2.5 py-1.5 rounded-lg bg-stone-800 hover:bg-stone-700 text-xs font-medium flex items-center gap-1 transition cursor-pointer"
+                  title="Lepas sesi Drive"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                </button>
+              </>
+            )}
+
+            <button
+              onClick={handleExportJson}
+              className="px-3 py-1.5 rounded-lg bg-stone-800 hover:bg-stone-700 text-xs font-medium flex items-center gap-1 transition cursor-pointer"
+            >
+              <Download className="w-3.5 h-3.5" /> Export JSON
+            </button>
+
+            <button
+              onClick={() => importJsonInputRef.current?.click()}
+              className="px-3 py-1.5 rounded-lg bg-stone-800 hover:bg-stone-700 text-xs font-medium flex items-center gap-1 transition cursor-pointer"
+            >
+              <Upload className="w-3.5 h-3.5" /> Import JSON
+            </button>
+
+            <button
+              onClick={() => setIsEditMode((v) => !v)}
+              className="px-3 py-1.5 rounded-lg bg-amber-900 hover:bg-amber-800 border border-amber-700 text-xs font-medium flex items-center gap-1 transition cursor-pointer"
+            >
+              {isEditMode ? (
+                <>
+                  <Eye className="w-3.5 h-3.5" /> Mode Baca
+                </>
+              ) : (
+                <>
+                  <Edit3 className="w-3.5 h-3.5" /> Mode Edit
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {/* Main Book Spread */}
+      <main className="flex-1 max-w-6xl w-full mx-auto p-4 md:p-6 flex flex-col justify-between gap-4">
+        {/* Baris Navigasi Halaman & Pencarian Nama Anggota Keluarga */}
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 bg-white/90 border border-stone-200 rounded-xl px-4 py-2.5 text-sm">
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="flex items-center gap-1.5 font-medium">
+              <Home className="w-4 h-4 text-amber-800" />
+              Halaman {currentPageIndex + 1} dari {familyKeys.length}
+            </span>
+
+            <select
+              value={currentFamilyId}
+              onChange={(e) => goToFamily(e.target.value)}
+              className="border border-stone-300 rounded-lg px-2.5 py-1 text-xs bg-white"
+            >
+              {Object.values(book.families).map((fam, idx) => {
+                const h = fam.husbandId ? book.people[fam.husbandId]?.name : '—';
+                const w = fam.wifeId ? book.people[fam.wifeId]?.name : '—';
+                return (
+                  <option key={fam.id} value={fam.id}>
+                    Hal {idx + 1}: {h} &amp; {w}
+                  </option>
+                );
+              })}
+            </select>
+
+            {isEditMode && (
+              <button
+                type="button"
+                onClick={() => bgPhotoInputRef.current?.click()}
+                className="px-2.5 py-1 rounded-lg border border-amber-800/40 bg-amber-50 hover:bg-amber-100 text-amber-950 text-xs font-medium flex items-center gap-1 cursor-pointer"
+              >
+                <ImagePlus className="w-3.5 h-3.5" /> Upload Background Halaman
+              </button>
+            )}
+          </div>
+
+          {/* Kotak Pencarian Nama */}
+          <div className="relative w-full md:w-72">
+            <div className="relative">
+              <Search className="w-4 h-4 text-stone-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Cari nama anggota keluarga..."
+                className="w-full pl-9 pr-3 py-1.5 rounded-lg border border-stone-300 text-xs bg-white focus:outline-none focus:border-amber-700"
+              />
+            </div>
+
+            {searchResults.length > 0 && (
+              <div className="absolute right-0 mt-1 w-full bg-white border border-stone-200 rounded-xl shadow-lg z-30 py-1">
+                {searchResults.map(({ person, targetFamilyId }) => (
+                  <button
+                    key={person.id}
+                    type="button"
+                    disabled={!targetFamilyId}
+                    onClick={() => targetFamilyId && goToFamily(targetFamilyId)}
+                    className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-center justify-between text-xs disabled:opacity-40 cursor-pointer"
+                  >
+                    <div>
+                      <p className="font-semibold text-stone-900">{person.name}</p>
+                      <p className="text-[11px] text-stone-500">
+                        {person.birthYear ? `Lahir ${person.birthYear}` : 'Anggota Keluarga'}
+                      </p>
+                    </div>
+                    <span className="text-amber-800 font-medium">Buka →</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Dua Halaman Buku dengan Foto Background Opsional */}
+        {currentFamily ? (
+          <div className="relative grid grid-cols-1 lg:grid-cols-2 bg-[#fdfbf7] border border-amber-900/20 rounded-2xl shadow-xl overflow-hidden">
+            {bgImageUrl && (
+              <div
+                className="pointer-events-none absolute inset-0 bg-cover bg-center opacity-15"
+                style={{ backgroundImage: `url(${bgImageUrl})` }}
+              />
+            )}
+
+            {/* Halaman Kiri: Keluarga Inti */}
+            <section className="relative z-10 p-6 md:p-8 border-b lg:border-b-0 lg:border-r border-amber-900/15 flex flex-col justify-between">
+              <div>
+                <div className="flex items-center justify-between text-xs uppercase tracking-wider text-amber-800/80 mb-4">
+                  <span className="flex items-center gap-1.5 font-semibold">
+                    <Heart className="w-3.5 h-3.5" /> Keluarga Inti
+                  </span>
+                  {currentFamily.marriageYear && <span>Menikah {currentFamily.marriageYear}</span>}
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6">
+                  {[husband, wife].map((person, idx) => {
+                    const pImg = person?.photoId ? photoUrls[person.photoId] : undefined;
+                    return (
+                      <div
+                        key={person?.id ?? `empty-${idx}`}
+                        className="p-4 rounded-xl bg-amber-50/85 backdrop-blur-[1px] border border-amber-900/10"
+                      >
+                        <div className="flex items-center gap-3">
+                          <div className="w-12 h-12 rounded-full bg-amber-200/70 border border-amber-900/15 overflow-hidden shrink-0 flex items-center justify-center text-xs font-bold text-amber-950">
+                            {pImg ? (
+                              <img
+                                src={pImg}
+                                alt={person?.name || 'Foto'}
+                                className="w-full h-full object-cover"
+                              />
+                            ) : (
+                              <span>{person?.name?.[0] || '?'}</span>
+                            )}
+                          </div>
+
+                          <div className="min-w-0">
+                            <p className="text-[11px] font-semibold uppercase text-stone-400">
+                              {idx === 0 ? 'Suami / Ayah' : 'Istri / Ibu'}
+                            </p>
+                            {person ? (
+                              <h2 className="font-serif text-base font-bold text-stone-900 truncate">
+                                {person.name}
+                              </h2>
+                            ) : (
+                              <p className="text-xs text-stone-400 italic">Belum tercatat</p>
+                            )}
+                          </div>
+                        </div>
+
+                        {person && (
+                          <>
+                            <p className="text-xs text-stone-500 mt-2">
+                              {person.birthYear
+                                ? `Lahir ${person.birthYear}`
+                                : 'Tahun lahir belum diisi'}
+                              {person.deathYear ? ` – Wafat ${person.deathYear}` : ''}
+                            </p>
+                            {person.notes && (
+                              <p className="text-xs text-stone-600 mt-1.5 leading-relaxed">
+                                {person.notes}
+                              </p>
+                            )}
+                            <div className="mt-3 flex flex-wrap items-center gap-3">
+                              {person.parentFamilyId && (
+                                <button
+                                  onClick={() => goToFamily(person.parentFamilyId!)}
+                                  className="text-xs text-amber-800 hover:underline font-medium cursor-pointer"
+                                >
+                                  ← Keluarga Asal
+                                </button>
+                              )}
+                              {isEditMode && (
+                                <button
+                                  type="button"
+                                  onClick={() => triggerProfilePhotoUpload(person.id)}
+                                  className="text-xs text-stone-700 hover:text-amber-900 underline cursor-pointer"
+                                >
+                                  Upload Foto
+                                </button>
+                              )}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {currentFamily.residence && (
+                  <p className="text-xs text-stone-700 mb-2">
+                    <span className="font-semibold">Domisili:</span> {currentFamily.residence}
+                  </p>
+                )}
+                {currentFamily.notes && (
+                  <p className="text-sm text-stone-700 bg-white/80 p-3.5 rounded-xl border border-stone-200/70">
+                    {currentFamily.notes}
+                  </p>
+                )}
+              </div>
+
+              <div className="pt-6 mt-6 border-t border-stone-200/70 flex items-center justify-between text-xs text-stone-500">
+                <span>Halaman Kiri</span>
+                <span>{currentFamily.backgroundPhotoId ? 'Memakai Background' : 'Tanpa Background'}</span>
+              </div>
+            </section>
+
+            {/* Halaman Kanan: Daftar Anak */}
+            <section className="relative z-10 p-6 md:p-8 flex flex-col justify-between bg-[#fffefa]/80">
+              <div>
+                <div className="flex items-center justify-between text-xs uppercase tracking-wider text-amber-800/80 mb-4">
+                  <span className="flex items-center gap-1.5 font-semibold">
+                    <Users className="w-3.5 h-3.5" /> Anak-Anak ({children.length})
+                  </span>
+                  <span>Generasi Berikutnya</span>
+                </div>
+
+                {children.length === 0 ? (
+                  <div className="text-center py-8 px-4 rounded-xl border border-dashed border-stone-300 text-stone-400 text-sm bg-white/60">
+                    Belum ada data anak tercatat pada halaman keluarga inti ini.
+                  </div>
+                ) : (
+                  <ul className="space-y-3">
+                    {children.map((child, index) => {
+                      const hasOwnFamily = child.ownFamilyIds.length > 0;
+                      const targetFamilyId = child.ownFamilyIds[0];
+                      const cImg = child.photoId ? photoUrls[child.photoId] : undefined;
+
+                      return (
+                        <li
+                          key={child.id}
+                          className="p-3.5 rounded-xl border border-stone-200 bg-white/90 hover:border-amber-700/40 transition flex items-center justify-between gap-3"
+                        >
+                          <div className="flex items-center gap-3 min-w-0">
+                            <div className="w-10 h-10 rounded-full bg-amber-100 border border-amber-900/10 overflow-hidden shrink-0 flex items-center justify-center text-xs font-bold text-amber-950">
+                              {cImg ? (
+                                <img
+                                  src={cImg}
+                                  alt={child.name}
+                                  className="w-full h-full object-cover"
+                                />
+                              ) : (
+                                <span>{child.name[0]}</span>
+                              )}
+                            </div>
+
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-900 shrink-0">
+                                  Anak ke-{index + 1}
+                                </span>
+                                <h3 className="font-serif font-bold text-stone-900 truncate">
+                                  {child.name}
+                                </h3>
+                              </div>
+                              <p className="text-xs text-stone-500 mt-1">
+                                {child.gender === 'M' ? 'Laki-laki' : 'Perempuan'}
+                                {child.birthYear ? ` • Lahir ${child.birthYear}` : ''}
+                                {isEditMode && (
+                                  <button
+                                    type="button"
+                                    onClick={() => triggerProfilePhotoUpload(child.id)}
+                                    className="ml-2 text-amber-800 underline cursor-pointer"
+                                  >
+                                    Upload Foto
+                                  </button>
+                                )}
+                              </p>
+                            </div>
+                          </div>
+
+                          {hasOwnFamily ? (
+                            <button
+                              onClick={() => goToFamily(targetFamilyId)}
+                              className="px-3 py-1.5 rounded-lg bg-amber-900 hover:bg-amber-800 text-amber-50 text-xs font-medium shrink-0 cursor-pointer"
+                            >
+                              Buka Keluarga →
+                            </button>
+                          ) : isEditMode ? (
+                            <button
+                              onClick={() => handleCreateChildFamilyPage(child)}
+                              className="px-3 py-1.5 rounded-lg border border-amber-800 text-amber-900 hover:bg-amber-50 text-xs font-medium shrink-0 cursor-pointer"
+                            >
+                              + Buat Halaman
+                            </button>
+                          ) : null}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+
+                {isEditMode && (
+                  <form
+                    onSubmit={handleAddChild}
+                    className="mt-5 p-4 rounded-xl bg-amber-50/90 border border-amber-900/15 space-y-3"
+                  >
+                    <p className="text-xs font-semibold text-amber-950 flex items-center gap-1.5">
+                      <UserPlus className="w-3.5 h-3.5" /> Tambah Anak ke Keluarga Ini
+                    </p>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                      <input
+                        type="text"
+                        placeholder="Nama lengkap anak"
+                        value={newChildName}
+                        onChange={(e) => setNewChildName(e.target.value)}
+                        className="border border-stone-300 rounded-lg px-2.5 py-1.5 text-xs bg-white"
+                        required
+                      />
+                      <select
+                        value={newChildGender}
+                        onChange={(e) => setNewChildGender(e.target.value as Gender)}
+                        className="border border-stone-300 rounded-lg px-2.5 py-1.5 text-xs bg-white"
+                      >
+                        <option value="M">Laki-laki</option>
+                        <option value="F">Perempuan</option>
+                      </select>
+                      <input
+                        type="text"
+                        placeholder="Tahun lahir (opsional)"
+                        value={newChildBirthYear}
+                        onChange={(e) => setNewChildBirthYear(e.target.value)}
+                        className="border border-stone-300 rounded-lg px-2.5 py-1.5 text-xs bg-white"
+                      />
+                    </div>
+                    <button
+                      type="submit"
+                      className="px-3.5 py-1.5 rounded-lg bg-amber-800 hover:bg-amber-700 text-white text-xs font-medium cursor-pointer"
+                    >
+                      Tambahkan Anak
+                    </button>
+                  </form>
+                )}
+              </div>
+
+              <div className="pt-6 mt-6 border-t border-stone-200/70 flex items-center justify-between text-xs text-stone-500">
+                <span>Halaman Kanan</span>
+                <span>Klik nama hasil cari untuk melompat halaman</span>
+              </div>
+            </section>
+          </div>
+        ) : null}
+
+        {/* Navigasi Halaman Bawah */}
+        <footer className="flex items-center justify-between pt-1">
+          <button
+            onClick={handleBackPage}
+            disabled={historyStack.length === 0 && currentPageIndex <= 0}
+            className="px-4 py-2 rounded-xl bg-white border border-stone-300 hover:bg-stone-50 text-sm font-medium flex items-center gap-1.5 disabled:opacity-40 cursor-pointer"
+          >
+            <ChevronLeft className="w-4 h-4" /> Halaman Sebelumnya
+          </button>
+
+          <button
+            onClick={handleNextPage}
+            disabled={currentPageIndex >= familyKeys.length - 1}
+            className="px-4 py-2 rounded-xl bg-amber-900 hover:bg-amber-800 text-amber-50 text-sm font-medium flex items-center gap-1.5 disabled:opacity-40 cursor-pointer"
+          >
+            Halaman Berikutnya <ChevronRight className="w-4 h-4" />
+          </button>
+        </footer>
+      </main>
+    </div>
+  );
+}
